@@ -4,7 +4,6 @@
 **Scope:** Cross-platform intrusion — Windows estate + Linux host
 **Environment:** Northpeak Logistics (simulated) — `npt-ws01`, `npt-srv01`, `npt-linux01`
 **Window:** Evening of 16 June 2026 – morning of 17 June 2026 (UTC)
-**Hunt type:** Community hunt, built by Dogukan Oruc, Cyber Range SOC
 
 ## Scenario
 
